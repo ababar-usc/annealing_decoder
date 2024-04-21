@@ -92,8 +92,8 @@ def convert_to_qubo(H):
     # create binary variables for each ising spin
     binary_vars = symbols(' '.join([f'x{i}' for i in range(1, len(Z)+1)]), commutative=False)
     # replace each ising spin with binary variable
-    binary_vars = map(lambda bin_var: 1-2*bin_var, binary_vars)
-    H_after_binary_vars = H.subs(dict(zip(Z, binary_vars)))
+    binary_vars_subs = map(lambda bin_var: 1-2*bin_var, binary_vars)
+    H_after_binary_vars = H.subs(dict(zip(Z, binary_vars_subs)))
 
     # replace with z_i
     terms_needing_substitution = []
@@ -115,8 +115,40 @@ def convert_to_qubo(H):
     penalty_ham = generate_penalty_hamiltonian(subs, z_terms)
     # return H + H penalty
     qubo_H = H_after_z_subs + expand(penalty_ham)
-    # TODO: replace with y_i (...)
+
+    # replace with y_i
+    y_vars = symbols(' '.join([f'y{i}' for i in range(1, len(binary_vars) + len(z_terms) + 1)]), commutative=False)
+    qubo_H = qubo_H.subs(dict(zip(binary_vars + z_terms, y_vars)))
     return qubo_H
+
+def convert_to_dwave_params(qubo_H, J, h, alpha, syndromes):
+    dwave_params = {}
+    for term in expand(qubo_H).args:
+        y_symbols_in_term = [symbol for symbol in term.free_symbols if 'y' in str(symbol)]
+
+        if len(y_symbols_in_term) > 2:
+            return ValueError("Qubo ham with more than 2 y terms: error in conversion process.")
+        # TODO: what do we do with this?
+        if len(y_symbols_in_term) == 0:
+            print(term)
+            continue
+        if len(y_symbols_in_term) == 2:
+            key = tuple([str(y_symbols_in_term[0]), str(y_symbols_in_term[1])])
+        if len(y_symbols_in_term) == 1:
+            key = tuple([str(y_symbols_in_term[0]), str(y_symbols_in_term[0])])\
+        # make substitutions
+        value = term.subs(dict(zip(y_symbols_in_term, [1]*len(y_symbols_in_term))))
+        # substitute for J, h, alpha
+        value = value.subs({symbols('J'): J, symbols('h'): h, symbols('a'): alpha})
+        # substitute for syndromes
+        # NB: the line below doesn't work for some reason
+        # value = value.subs({symbols(f's{i+1}'): syndromes[i] for i in range(len(syndromes))})
+        syndrome_symbols_in_term = [symbol for symbol in value.free_symbols if 's' in str(symbol)]
+        syndromes_indexes = [int(re.search(r'\d+', str(s)).group()) for s in syndrome_symbols_in_term]
+        syndromes_in_term = [syndromes[i-1] for i in syndromes_indexes]
+        value = value.subs(dict(zip(syndrome_symbols_in_term, syndromes_in_term)))
+        dwave_params[key] = value
+    return dwave_params
 
 stab_gen_x = [X1*X4*X6, X2*X4*X5*X7, X3*X5*X8, X6*X9*X11, X7*X9*X10*X12, X8*X10*X13]
 stab_gen_z = [Z1*Z4*Z6, Z2*Z4*Z5*Z7, Z3*Z5*Z8, Z6*Z9*Z11, Z7*Z9*Z10*Z12, Z8*Z10*Z13]
@@ -125,4 +157,7 @@ H_x = gen_four_body_ham(stab_gen_x, X)
 H_z = gen_four_body_ham(stab_gen_z, Z)
 
 qubo_H = convert_to_qubo(H_z)
-for term in qubo_H.args: print(term)
+# for term in qubo_H.args: print(term)
+dwave_params = convert_to_dwave_params(qubo_H, 10, 5, 1, [1, 1, 1, 1, 1, 1])
+for key, val in dwave_params.items():
+    print(key, val)
