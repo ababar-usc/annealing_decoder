@@ -1,14 +1,14 @@
 from sympy import *
 from functools import reduce
 import re
+from dwave.system import DWaveSampler, EmbeddingComposite
+import dimod
+import dwave.inspector
 
-X = [X1, X2, X3, X4, X5, X6, X7, X8, X9, X10, X11, X12, X13] = (
-    symbols('X1 X2 X3 X4 X5 X6 X7 X8 X9 X10 X11 X12, X13')
-)
+import minorminer
+# import matplotlib.pyplot as plt
+import dimod
 
-Z = [Z1, Z2, Z3, Z4, Z5, Z6, Z7, Z8, Z9, Z10, Z11, Z12, Z13] = (
-    symbols('Z1 Z2 Z3 Z4 Z5 Z6 Z7 Z8 Z9 Z10 Z11 Z12, Z13')
-)
 
 def gen_four_body_ham(gen_stabs, sigmas):
     # H = - J (Σ syndrome * stab) - h (Σ sigma_i)
@@ -88,16 +88,17 @@ def generate_penalty_hamiltonian(subs, z_terms):
     alpha = symbols('a')
     return alpha * penalty_term
 
-def convert_to_qubo(H):
+def convert_to_qubo(H, Z):
     # create binary variables for each ising spin
     binary_vars = symbols(' '.join([f'x{i}' for i in range(1, len(Z)+1)]), commutative=False)
     # replace each ising spin with binary variable
-    binary_vars_subs = map(lambda bin_var: 1-2*bin_var, binary_vars)
+    binary_vars_subs = list(map(lambda bin_var: 1-2*bin_var, binary_vars))
     H_after_binary_vars = H.subs(dict(zip(Z, binary_vars_subs)))
 
     # replace with z_i
     terms_needing_substitution = []
-    for term in expand(H_after_binary_vars).args:
+    # TODO: assuming terms are stored in ascending order of number of x symbols, robustify
+    for term in expand(H_after_binary_vars).args[::-1]:
         x_symbols_in_term = [symbol for symbol in term.free_symbols if 'x' in str(symbol)]
         x_symbols_strings_ordered = [symbol for symbol in str(term).split('*') if 'x' in symbol]
         x_symbols_in_term_ordered = sorted(x_symbols_in_term, key=lambda x: x_symbols_strings_ordered.index(str(x)))
@@ -128,9 +129,8 @@ def convert_to_dwave_params(qubo_H, J, h, alpha, syndromes):
 
         if len(y_symbols_in_term) > 2:
             return ValueError("Qubo ham with more than 2 y terms: error in conversion process.")
-        # TODO: what do we do with this?
+        # NB: we don't care about terms with no y symbols
         if len(y_symbols_in_term) == 0:
-            print(term)
             continue
         if len(y_symbols_in_term) == 2:
             key = tuple([str(y_symbols_in_term[0]), str(y_symbols_in_term[1])])
@@ -150,14 +150,64 @@ def convert_to_dwave_params(qubo_H, J, h, alpha, syndromes):
         dwave_params[key] = value
     return dwave_params
 
-stab_gen_x = [X1*X4*X6, X2*X4*X5*X7, X3*X5*X8, X6*X9*X11, X7*X9*X10*X12, X8*X10*X13]
-stab_gen_z = [Z1*Z4*Z6, Z2*Z4*Z5*Z7, Z3*Z5*Z8, Z6*Z9*Z11, Z7*Z9*Z10*Z12, Z8*Z10*Z13]
+def gen_d3_surface_code_qubo_hamiltonian():
+    X = [X1, X2, X3, X4, X5, X6, X7, X8, X9, X10, X11, X12, X13] = (
+        symbols('X1 X2 X3 X4 X5 X6 X7 X8 X9 X10 X11 X12, X13')
+    )
+    Z = [Z1, Z2, Z3, Z4, Z5, Z6, Z7, Z8, Z9, Z10, Z11, Z12, Z13] = (
+        symbols('Z1 Z2 Z3 Z4 Z5 Z6 Z7 Z8 Z9 Z10 Z11 Z12, Z13')
+    )
+    stab_gen_x = [X1*X4*X6, X2*X4*X5*X7, X3*X5*X8, X6*X9*X11, X7*X9*X10*X12, X8*X10*X13]
+    stab_gen_z = [Z1*Z4*Z6, Z2*Z4*Z5*Z7, Z3*Z5*Z8, Z6*Z9*Z11, Z7*Z9*Z10*Z12, Z8*Z10*Z13]
+    # ising hamiltonian
+    H_x = gen_four_body_ham(stab_gen_x, X)
+    H_z = gen_four_body_ham(stab_gen_z, Z)
+    # qubo hamiltonian
+    qubo_H = convert_to_qubo(H_z, Z)
+    return qubo_H
 
-H_x = gen_four_body_ham(stab_gen_x, X)
-H_z = gen_four_body_ham(stab_gen_z, Z)
+def gen_steane_code_qubo_hamitonian():
+    # NB: enforcing non-commutativity s.t. substitution order is preserved
+    steane_Z = [Z1, Z2, Z3, Z4, Z5, Z6, Z7] = (
+        symbols('Z1 Z2 Z3 Z4 Z5 Z6 Z7', commutative=False)
+    )
+    steane_z_stabs = [Z4*Z5*Z6*Z7, Z2*Z3*Z6*Z7, Z1*Z3*Z5*Z7]
+    H_z = gen_four_body_ham(steane_z_stabs, steane_Z)
+    # for term in H_z.args: print(term)
+    qubo_H = convert_to_qubo(H_z, steane_Z)
+    # for term in qubo_H.args: print(term)
+    return qubo_H
 
-qubo_H = convert_to_qubo(H_z)
-# for term in qubo_H.args: print(term)
-dwave_params = convert_to_dwave_params(qubo_H, 10, 5, 1, [1, 1, 1, 1, 1, 1])
-for key, val in dwave_params.items():
-    print(key, val)
+def gen_dwave_pegasus_embedding():
+    sampler = DWaveSampler(solver=dict(topology__type='pegasus'))
+    # Q = {('q2', 'q2'): 0.1, ('q1', 'q2'): -0.1, ('q1', 'q3'): 0.1, ('q2', 'q3'): -0.1,}
+
+    bqm = dimod.BQM({}, Q, 0, dimod.Vartype.SPIN)
+    sampleset = dimod.ExactSolver().sample(bqm)
+    print(sampleset)
+    embedding = minorminer.find_embedding(
+                dimod.to_networkx_graph(bqm), sampler.to_networkx_graph()
+            )
+    print(embedding)
+
+def run_steane_in_dwave():
+    steane_qubo_h = gen_steane_code_qubo_hamitonian()
+    # NB: J has to be greater than (d-1)*h/4
+    J=1024
+    a = 8*J
+    h = 1
+    syndromes = [1,1,1]
+    steane_dwave_params = convert_to_dwave_params(steane_qubo_h, J, a, h, syndromes)
+    # Define problem
+    bqm = dimod.BQM({}, steane_dwave_params, 0, dimod.Vartype.SPIN)
+    #bqm.add_linear_from({v: 1 for v in bqm.variables})
+    # Get sampler
+    sampler = EmbeddingComposite(DWaveSampler())
+    # Sample with low chain strength
+    sampleset1 = sampler.sample(bqm, num_reads=5000, chain_strength=1)
+    # TODO: this opens the browser, port code to python notebook for better visualization
+    # Inspect the problem::
+    # dwave.inspector.show(sampleset1)
+    print(sampleset1)
+
+run_steane_in_dwave()
